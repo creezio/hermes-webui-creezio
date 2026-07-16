@@ -7,7 +7,7 @@ Covers:
   - apply_force_update() returns ok on clean reset path (#813)
   - /api/updates/force route exists in routes.py (#813)
   - UI: _showUpdateError and forceUpdate functions exist in ui.js (#813)
-  - UI: updateError element and btnForceUpdate element exist in index.html (#813)
+  - UI: updateError element exists; Creezio fork removes self-update buttons (#813)
   - UI: success toast says 'Restarting' not 'Reloading' (#814)
   - UI: reload timeout bumped to 2500 ms to allow server restart (#814)
 """
@@ -31,6 +31,11 @@ REPO = pathlib.Path(__file__).parent.parent
 
 def read(rel):
     return (REPO / rel).read_text(encoding='utf-8')
+
+
+def creezio_self_update_ui_disabled() -> bool:
+    """True on the Creezio fork where apply/force/clear-lock controls were removed."""
+    return 'id="btnForceUpdate"' not in read('static/index.html')
 
 
 def extract_js_function(src: str, name: str) -> str:
@@ -2354,7 +2359,51 @@ if(_formatUpdateTargetStatus('WebUI', {{ no_git: true, behind: 1 }}) !== null) t
         format_fn = extract_js_function(src, '_formatUpdateTargetStatus')
         instruction_fn = extract_js_function(src, '_formatManualUpdateInstruction')
         show_fn = extract_js_function(src, '_showUpdateBanner')
-        script = f"""
+        if creezio_self_update_ui_disabled():
+            script = f"""
+const state = {{
+  updateBanner: {{ classList: {{ added: false, add() {{ this.added = true; }}, remove() {{ this.removed = true; }} }} }},
+  updateMsg: {{
+    innerHTML: '',
+    textContent: '',
+    appendChild(el) {{
+      const text = el.textContent || '';
+      this.textContent += text;
+      this.innerHTML += text;
+    }},
+  }},
+  updateWhatsNewLinks: {{ style: {{ display: 'none' }}, replaceChildren() {{ this.cleared = true; }} }},
+}};
+global.window = {{}};
+global.document = {{
+  createElement() {{
+    return {{ textContent: '', style: {{ marginTop: '', lineHeight: '' }} }};
+  }},
+}};
+global.$ = (id) => state[id] || null;
+global._renderUpdateWhatsNewLinks = () => {{}};
+{format_fn}
+{instruction_fn}
+{show_fn}
+_showUpdateBanner({{
+  webui: {{
+    no_git: true,
+    manual_update: true,
+    behind: 1,
+    release_based: true,
+    current_version: 'v0.51.833',
+    latest_version: 'v0.51.913',
+    compare_url: 'https://github.com/nesquena/hermes-webui/compare/current-sha...latest-sha',
+  }},
+  agent: null,
+}});
+if(state.updateMsg.textContent.indexOf('WebUI') === -1) throw new Error('manual update must still render banner text');
+if(state.updateMsg.textContent.indexOf('hermes-upstream-sync-creezio') === -1) throw new Error('creezio banner must mention upstream sync skill');
+if(state.updateMsg.textContent.indexOf('fork Creezio') === -1) throw new Error('creezio banner must mention fork Creezio');
+if(state.updateBanner.classList.added !== true) throw new Error('manual update must show the banner');
+""".strip()
+        else:
+            script = f"""
 const state = {{
   updateBanner: {{ classList: {{ added: false, add() {{ this.added = true; }}, remove() {{ this.removed = true; }} }} }},
   updateMsg: {{ textContent: '' }},
@@ -2458,7 +2507,7 @@ function _showUpdateBanner() {{}}
 # ── static/index.html ─────────────────────────────────────────────────────────
 
 class TestIndexHtmlBanner:
-    """#813 — update banner HTML must include error element and force button."""
+    """#813 — update banner HTML must include error element; Creezio removes apply controls."""
 
     def test_update_error_element_exists(self):
         src = read('static/index.html')
@@ -2468,12 +2517,21 @@ class TestIndexHtmlBanner:
 
     def test_force_update_button_exists(self):
         src = read('static/index.html')
+        if creezio_self_update_ui_disabled():
+            assert 'id="btnForceUpdate"' not in src, (
+                "Creezio fork must not expose #btnForceUpdate in index.html"
+            )
+            assert 'id="btnApplyUpdate"' not in src
+            assert 'dismissUpdate()' in src
+            return
         assert 'id="btnForceUpdate"' in src, (
             "index.html must have #btnForceUpdate button (hidden by default)"
         )
 
     def test_force_update_button_hidden_by_default(self):
         src = read('static/index.html')
+        if creezio_self_update_ui_disabled():
+            pytest.skip("Creezio fork removes self-update buttons from index.html")
         m = re.search(r'id="btnForceUpdate"[^>]*>', src)
         assert m, "#btnForceUpdate not found"
         tag = m.group(0)
@@ -2483,14 +2541,19 @@ class TestIndexHtmlBanner:
 
 
 class TestClearLockButton:
-    """PR #5688 follow-up: clear-lock button must exist in index.html and be
-    hidden by default. Without this, the v2 frontend recovery path is dead --
-    $('btnClearUpdateLock') returns null at runtime so the lock-only error
-    branch in _showUpdateError() never reveals a clickable affordance (P1).
+    """PR #5688 follow-up: upstream requires a clear-lock button in index.html.
+
+    Creezio fork: button removed from DOM; ui.js still guards with
+    ``if (clearLockBtn && res.lock_conflict)`` so missing DOM is safe.
     """
 
     def test_clear_lock_button_exists(self):
         src = read('static/index.html')
+        if creezio_self_update_ui_disabled():
+            assert 'id="btnClearUpdateLock"' not in src, (
+                "Creezio fork must not expose #btnClearUpdateLock in index.html"
+            )
+            return
         assert 'id="btnClearUpdateLock"' in src, (
             "index.html must have #btnClearUpdateLock button (hidden by "
             "default) -- PR #5688 v2 frontend path"
@@ -2498,6 +2561,8 @@ class TestClearLockButton:
 
     def test_clear_lock_button_hidden_by_default(self):
         src = read('static/index.html')
+        if creezio_self_update_ui_disabled():
+            pytest.skip("Creezio fork removes clear-lock button from index.html")
         m = re.search(r'id="btnClearUpdateLock"[^>]*>', src)
         assert m, "#btnClearUpdateLock not found"
         tag = m.group(0)
@@ -2507,6 +2572,15 @@ class TestClearLockButton:
 
     def test_clear_lock_button_calls_applyClearUpdateLock_handler(self):
         src = read('static/index.html')
+        if creezio_self_update_ui_disabled():
+            ui = read('static/ui.js')
+            m = re.search(r'function _showUpdateError\b.*?\n\}', ui, re.DOTALL)
+            assert m, "_showUpdateError() not found"
+            fn = m.group(0)
+            assert 'clearLockBtn' in fn and 'lock_conflict' in fn, (
+                "_showUpdateError must still guard clear-lock affordance when DOM absent"
+            )
+            return
         m = re.search(r'id="btnClearUpdateLock"[^>]*>', src)
         assert m, "#btnClearUpdateLock not found"
         tag = m.group(0)
@@ -3209,10 +3283,13 @@ class TestForceButtonResetOnRetry:
         # The reset must appear BEFORE the main update loop, so it runs on
         # every retry — not only on first invocation.
         setup, _, rest = fn.partition('const targets=')
-        assert 'btnForceUpdate' in setup, (
+        assert 'btnForceUpdate' in setup or 'forceBtnReset' in setup, (
             "applyUpdates must reset btnForceUpdate visibility before "
             "starting the update loop (stale conflict state otherwise "
             "persists across retries)"
+        )
+        assert "if(forceBtnReset)" in setup.replace(' ', '') or "if (forceBtnReset)" in setup, (
+            "applyUpdates setup must guard force-button reset when DOM button is absent"
         )
         assert "display='none'" in setup or "display = 'none'" in setup, (
             "applyUpdates setup must hide btnForceUpdate via display:none"

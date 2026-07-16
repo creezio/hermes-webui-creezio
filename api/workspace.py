@@ -145,6 +145,95 @@ def _is_remote_terminal_backend(terminal_cfg: dict | None) -> bool:
     return backend not in ('', 'local')
 
 
+def _isolated_site_workspace_root() -> str | None:
+    """Host-side project root for isolated single-site deployments (e.g. Creezio WP sites)."""
+    try:
+        from api.config import get_config
+
+        webui_cfg = get_config().get('webui') or {}
+        if not webui_cfg.get('isolated_site'):
+            return None
+        root = str(webui_cfg.get('workspace_root') or '').strip()
+        if not root:
+            return None
+        resolved = _resolve_path(root)
+        if resolved.is_dir():
+            return str(resolved)
+        return root
+    except Exception:
+        logger.debug("Failed to read isolated site workspace_root", exc_info=True)
+        return None
+
+
+def _isolated_site_display_name() -> str | None:
+    root = _isolated_site_workspace_root()
+    if not root:
+        return None
+    return Path(root).name or None
+
+
+def _isolated_terminal_workspace_path() -> str | None:
+    """Container-side cwd for docker/ssh backends (typically ``/workspace``)."""
+    return _remote_terminal_cwd()
+
+
+def _map_path_for_isolated_display(path: str) -> str:
+    """Map docker mount points like ``/workspace`` to the host project directory."""
+    root = _isolated_site_workspace_root()
+    terminal_ws = _isolated_terminal_workspace_path()
+    if not root or not terminal_ws:
+        return path
+    norm_path = _normalize_posix_path(path)
+    norm_terminal = _normalize_posix_path(terminal_ws)
+    norm_root = _normalize_posix_path(root)
+    if norm_path and norm_terminal and norm_path == norm_terminal:
+        return norm_root or root
+    try:
+        if _resolve_path(path) == _resolve_path(root):
+            return str(_resolve_path(root))
+    except Exception:
+        if str(path).rstrip('/') == str(root).rstrip('/'):
+            return root
+    return path
+
+
+def _isolated_host_workspace_candidate(raw: str) -> str | None:
+    """Accept the configured host workspace root for isolated docker profiles."""
+    root = _isolated_site_workspace_root()
+    if not root or not raw:
+        return None
+    try:
+        if _resolve_path(raw) == _resolve_path(root):
+            return str(_resolve_path(root))
+    except Exception:
+        if str(raw).rstrip('/') == str(root).rstrip('/'):
+            return root
+    return None
+
+
+def _publicize_workspace_entry(entry: dict) -> dict:
+    """Normalize workspace entries for the UI (host path + real folder name)."""
+    path = str(entry.get('path', '') or '')
+    name = str(entry.get('name', '') or '')
+    display_path = _map_path_for_isolated_display(path)
+    display_name = name
+    slug = _isolated_site_display_name()
+    if slug:
+        if not name or name.lower() in ('default', 'home'):
+            display_name = slug
+    elif name.lower() == 'default':
+        display_name = 'Home'
+    if not display_name:
+        display_name = Path(display_path).name or 'Home'
+    return {'path': display_path, 'name': display_name}
+
+
+def _default_workspace_list_entry() -> dict:
+    return _publicize_workspace_entry(
+        {'path': _profile_default_workspace(), 'name': 'Home'}
+    )
+
+
 def _remote_terminal_cwd() -> str | None:
     """Return target-side terminal cwd for remote profiles, without local stat()."""
     try:
@@ -220,6 +309,10 @@ def _profile_default_workspace() -> str:
                 p = _resolve_path(str(ws))
                 if remote_terminal or p.is_dir():
                     return str(p)
+        # Isolated site profiles: prefer the host project root over container cwd
+        isolated_root = _isolated_site_workspace_root()
+        if isolated_root:
+            return isolated_root
         # Fall through to terminal.cwd — the agent's configured working directory
         if isinstance(terminal_cfg, dict):
             cwd = terminal_cfg.get('cwd', '')
@@ -274,6 +367,15 @@ def _clean_workspace_list(workspaces: list) -> list:
                 continue  # under profiles/ but not our own — cross-profile leak, skip
         except ValueError:
             pass  # not under profiles/ at all — keep it
+        if _isolated_site_workspace_root():
+            display_path = _map_path_for_isolated_display(str(p))
+            slug = _isolated_site_display_name()
+            if slug and (not name or name.lower() in ('default', 'home')):
+                name = slug
+            elif name.lower() == 'default':
+                name = 'Home'
+            result.append({'path': display_path, 'name': name})
+            continue
         # Rename confusing 'default' label to 'Home'
         if name.lower() == 'default':
             name = 'Home'
@@ -348,7 +450,7 @@ def load_workspaces() -> list:
                     )
                 except Exception:
                     logger.debug("Failed to persist cleaned workspace list")
-            return cleaned or [{'path': _profile_default_workspace(), 'name': 'Home'}]
+            return cleaned or [_default_workspace_list_entry()]
         except Exception:
             logger.debug("Failed to load workspaces from %s", ws_file)
     # No profile-local file yet.
@@ -363,8 +465,8 @@ def load_workspaces() -> list:
         migrated = _migrate_global_workspaces()
         if migrated:
             return migrated
-    # Fresh start: single entry from the profile's configured workspace, labeled "Home"
-    return [{'path': _profile_default_workspace(), 'name': 'Home'}]
+    # Fresh start: single entry from the profile's configured workspace
+    return [_default_workspace_list_entry()]
 
 
 def save_workspaces(workspaces: list) -> None:
@@ -395,10 +497,13 @@ def get_profile_default_workspace() -> str:
             return None
         if remote_cwd:
             if _remote_terminal_workspace_candidate(raw) is not None:
-                return raw
+                return _map_path_for_isolated_display(raw)
+            host = _isolated_host_workspace_candidate(raw)
+            if host is not None:
+                return host
             return None
         if Path(raw).is_dir():
-            return raw
+            return _map_path_for_isolated_display(raw)
         return None
 
     lw_file = _last_workspace_file()
@@ -409,7 +514,7 @@ def get_profile_default_workspace() -> str:
                 return p
         except Exception:
             logger.debug("Failed to read profile last workspace from %s", lw_file)
-    return _profile_default_workspace()
+    return _map_path_for_isolated_display(_profile_default_workspace())
 
 
 def get_last_workspace() -> str:
@@ -423,10 +528,13 @@ def get_last_workspace() -> str:
             # not accept stale server-local paths merely because they exist on
             # the WebUI host; require the value to stay under terminal.cwd.
             if _remote_terminal_workspace_candidate(raw) is not None:
-                return raw
+                return _map_path_for_isolated_display(raw)
+            host = _isolated_host_workspace_candidate(raw)
+            if host is not None:
+                return host
             return None
         if Path(raw).is_dir():
-            return raw
+            return _map_path_for_isolated_display(raw)
         return None
 
     lw_file = _last_workspace_file()
@@ -445,14 +553,14 @@ def get_last_workspace() -> str:
                 return p
         except Exception:
             logger.debug("Failed to read global last workspace")
-    return _profile_default_workspace()
+    return _map_path_for_isolated_display(_profile_default_workspace())
 
 
 def set_last_workspace(path: str) -> None:
     try:
         lw_file = _last_workspace_file()
         lw_file.parent.mkdir(parents=True, exist_ok=True)
-        lw_file.write_text(str(path), encoding='utf-8')
+        lw_file.write_text(_map_path_for_isolated_display(str(path)), encoding='utf-8')
     except Exception:
         logger.debug("Failed to set last workspace")
 
@@ -836,6 +944,9 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
             raise ValueError(access_error)
 
     if remote_candidate is not None:
+        host = _isolated_host_workspace_candidate(str(path))
+        if host is not None:
+            return _resolve_path(host)
         return remote_candidate
 
     # (A) Trusted if under the user's home directory — cross-platform via Path.home()
